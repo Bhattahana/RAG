@@ -68,7 +68,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG  — edit these two values
 # ══════════════════════════════════════════════════════════════════════════════
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.Ab8RN6I-snGyy3zMSkcxhW-Atu6q4KG3a2WCgSlmx-1VIjtgFg")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.A")
 GEMINI_MODEL    = "gemini-2.5-flash"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
