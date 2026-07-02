@@ -1,48 +1,4 @@
-"""
-chatbot.py  —  ONGC Tender Chatbot  (Gemini + Ollama Dual Backend)
-===================================================================
-Supports two LLM backends — user picks at startup (or via CLI flag):
 
-  [1] Gemini 1.5 Flash   — FREE cloud API, no RAM needed, needs internet
-                           Get key: https://aistudio.google.com/app/apikey
-
-  [2] Ollama (local)     — FREE local model, no internet, needs ~4 GB RAM
-                           Install: https://ollama.com/download
-                           Then:    ollama pull qwen2.5:3b && ollama serve
-
-Fallback logic:
-  • If Gemini key is missing/invalid  → auto-fallback to Ollama
-  • If Ollama is not running          → auto-fallback to Gemini
-  • If BOTH unavailable               → clear error message + exit
-
-All features work identically on both backends:
-  ✓ Streaming output token by token
-  ✓ Full source references  (file | page | section | relevance | OCR conf)
-  ✓ Human feedback loop     [y] Correct  [n] Wrong+correction  [s] Skip
-  ✓ Session history saved   chat_history/<timestamp>_session.json
-  ✓ Compliance report       /report  → compliance_results/*.json
-  ✓ Compliance Q&A mode     /compliance  (clause-by-clause)
-  ✓ Vendor filter           /vendor <name>
-  ✓ Vendor comparison       /compare <a,b>  — side-by-side, auto-prompted at startup
-  ✓ Sliding window memory   (last 6 turns)
-
-Usage
------
-    python chatbot.py                    # prompts for backend choice
-    python chatbot.py --backend gemini   # skip prompt, use Gemini
-    python chatbot.py --backend ollama   # skip prompt, use Ollama
-    python chatbot.py --vendor Vendor_A  # pre-select vendor
-    python chatbot.py --compare          # compare all detected vendors
-    python chatbot.py --no-feedback      # disable feedback prompt
-
-Config (edit section below)
----------------------------
-    GEMINI_API_KEY  — paste your free key here
-    OLLAMA_MODEL    — change to qwen2.5:7b for better quality
-    RETRIEVAL_TOP_K — how many chunks to retrieve per question
-
-Place at:  ONGC_RAG/chatbot.py
-"""
 
 import json
 import os
