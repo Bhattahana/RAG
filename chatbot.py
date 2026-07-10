@@ -1,4 +1,48 @@
+"""
+chatbot.py  —  ONGC Tender Chatbot  (Gemini + Ollama Dual Backend)
+===================================================================
+Supports two LLM backends — user picks at startup (or via CLI flag):
 
+  [1] Gemini 1.5 Flash   — FREE cloud API, no RAM needed, needs internet
+                           Get key: https://aistudio.google.com/app/apikey
+
+  [2] Ollama (local)     — FREE local model, no internet, needs ~4 GB RAM
+                           Install: https://ollama.com/download
+                           Then:    ollama pull qwen2.5:3b && ollama serve
+
+Fallback logic:
+  • If Gemini key is missing/invalid  → auto-fallback to Ollama
+  • If Ollama is not running          → auto-fallback to Gemini
+  • If BOTH unavailable               → clear error message + exit
+
+All features work identically on both backends:
+  ✓ Streaming output token by token
+  ✓ Full source references  (file | page | section | relevance | OCR conf)
+  ✓ Human feedback loop     [y] Correct  [n] Wrong+correction  [s] Skip
+  ✓ Session history saved   chat_history/<timestamp>_session.json
+  ✓ Compliance report       /report  → compliance_results/*.json
+  ✓ Compliance Q&A mode     /compliance  (clause-by-clause)
+  ✓ Vendor filter           /vendor <name>
+  ✓ Vendor comparison       /compare <a,b>  — side-by-side, auto-prompted at startup
+  ✓ Sliding window memory   (last 6 turns)
+
+Usage
+-----
+    python chatbot.py                    # prompts for backend choice
+    python chatbot.py --backend gemini   # skip prompt, use Gemini
+    python chatbot.py --backend ollama   # skip prompt, use Ollama
+    python chatbot.py --vendor Vendor_A  # pre-select vendor
+    python chatbot.py --compare          # compare all detected vendors
+    python chatbot.py --no-feedback      # disable feedback prompt
+
+Config (edit section below)
+---------------------------
+    GEMINI_API_KEY  — paste your free key here
+    OLLAMA_MODEL    — change to qwen2.5:7b for better quality
+    RETRIEVAL_TOP_K — how many chunks to retrieve per question
+
+Place at:  ONGC_RAG/chatbot.py
+"""
 
 import json
 import os
@@ -24,7 +68,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG  — edit these two values
 # ══════════════════════════════════════════════════════════════════════════════
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AQ.A")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "key")
 GEMINI_MODEL    = "gemini-2.5-flash"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
@@ -129,8 +173,9 @@ class GeminiBackend(LLMBackend):
         self._call_count     = 0
 
     def is_available(self) -> bool:
-        """Test the key with a tiny probe request."""
+        """Test the key with a tiny probe request. Prints the real reason on failure."""
         if not self.api_key or self.api_key == "YOUR_GEMINI_KEY_HERE":
+            print("  ✗ No Gemini API key set (GEMINI_API_KEY is empty/placeholder).")
             return False
         try:
             url = (
@@ -142,8 +187,19 @@ class GeminiBackend(LLMBackend):
                 "generationConfig": {"maxOutputTokens": 5},
             }
             r = self.session.post(url, json=payload, timeout=8)
-            return r.status_code == 200
-        except Exception:
+            if r.status_code != 200:
+                print(f"  ✗ Gemini probe failed — HTTP {r.status_code}")
+                print(f"    {r.text[:500]}")
+                return False
+            return True
+        except requests.exceptions.ConnectionError as e:
+            print(f"  ✗ Gemini probe failed — network/connection error: {e}")
+            return False
+        except requests.exceptions.Timeout:
+            print("  ✗ Gemini probe failed — request timed out after 8s.")
+            return False
+        except Exception as e:
+            print(f"  ✗ Gemini probe failed — unexpected error: {type(e).__name__}: {e}")
             return False
 
     def _url(self, stream: bool = False) -> str:
@@ -322,6 +378,44 @@ class OllamaBackend(LLMBackend):
 # ══════════════════════════════════════════════════════════════════════════════
 #  BACKEND SELECTOR  — runs at startup
 # ══════════════════════════════════════════════════════════════════════════════
+def select_backend_api(force: Optional[str] = None) -> LLMBackend:
+    """
+    Non-interactive backend selection for programmatic/API use (no input(),
+    no sys.exit()).  Mirrors select_backend()'s priority logic but raises
+    RuntimeError instead of exiting the process, since this is meant to run
+    inside a long-lived server.
+
+    Priority: forced backend > Gemini (if available) > Ollama (if available).
+    """
+    gemini = GeminiBackend()
+    ollama = OllamaBackend()
+
+    if force == "gemini":
+        if gemini.is_available():
+            return gemini
+        raise RuntimeError(
+            "Gemini unavailable — check GEMINI_API_KEY env var and internet connection."
+        )
+
+    if force == "ollama":
+        if ollama.is_available():
+            return ollama
+        raise RuntimeError(
+            f"Ollama unavailable — make sure 'ollama serve' is running and "
+            f"'{OLLAMA_MODEL}' is pulled."
+        )
+
+    if gemini.is_available():
+        return gemini
+    if ollama.is_available():
+        return ollama
+
+    raise RuntimeError(
+        "Neither backend is available. Set GEMINI_API_KEY, or run "
+        f"'ollama serve' + 'ollama pull {OLLAMA_MODEL}'."
+    )
+
+
 def select_backend(force: Optional[str] = None) -> LLMBackend:
     """
     Determine which backend to use.
@@ -788,6 +882,21 @@ class TenderChatbot:
         self.compare_vendors: list[str]   = []
         self.feedback_mode: bool         = True
 
+    def reload_retriever(self) -> None:
+        """
+        Rebuild self.retriever from the current on-disk vector store, in place.
+        Call this after a background embedding job finishes writing new/updated
+        vectors, so the next query sees them without needing to restart the
+        whole chatbot (which would also drop conversation memory/session state).
+
+        Builds the replacement retriever first, then swaps the attribute in a
+        single assignment — any query already in flight keeps using the old
+        retriever object it grabbed a reference to; the next query gets the
+        new one.
+        """
+        print("\n  Reloading retriever (picking up newly embedded vectors)…")
+        self.retriever = HybridRetriever(use_reranker=False)
+
     # ── vendor filter ─────────────────────────────────────────────────────────
     def _set_vendor(self, name: str):
         self.active_vendor = name.strip() if name.strip() else None
@@ -951,6 +1060,67 @@ class TenderChatbot:
         self.session.record(question, answer, chunks, clause_no=clause_no)
 
         return answer
+
+    # ── API-friendly streaming ask (no stdout printing, no compare mode) ───────
+    def ask_stream(self, question: str, clause_no: str = "") -> Iterator[str]:
+        """
+        Same retrieval + generation flow as ask(), but yields answer tokens
+        instead of printing them, and does not handle compare mode (use the
+        non-streaming JSON endpoint / ask() for comparisons). Intended for use
+        by api.py to power a Server-Sent-Events / streaming HTTP response.
+
+        After the generator is exhausted, self.last_chunks / self.last_answer
+        are populated exactly as they are after ask(), and the turn has been
+        recorded into self.session + self.memory.
+        """
+        chunks = self.retriever.search(question, n_results=RETRIEVAL_TOP_K)
+
+        if self.active_vendor:
+            filtered = [
+                c for c in chunks
+                if c.get("vendor", "").lower() == self.active_vendor.lower()
+            ]
+            chunks = filtered if filtered else chunks
+
+        self.last_chunks = chunks
+
+        if not chunks:
+            answer = (
+                "No relevant content found in the indexed documents. "
+                "Try rephrasing or ensure vendor documents have been processed."
+            )
+            self.session.record(question, answer, [], clause_no=clause_no)
+            self.last_answer = answer
+            yield answer
+            return
+
+        context = build_context_block(chunks)
+        system  = SYSTEM_PROMPT
+        if self.active_vendor:
+            system += (
+                f"\n\nACTIVE VENDOR: {self.active_vendor}. "
+                "Only cite evidence from this vendor's documents."
+            )
+
+        messages = list(self.memory.get()) + [{
+            "role":    "user",
+            "content": f"{context}\n\nQuestion: {question}",
+        }]
+
+        answer = ""
+        for token in self.llm.stream(
+            messages    = messages,
+            system      = system,
+            temperature = 0.1,
+            max_tokens  = 2000,
+        ):
+            answer += token
+            yield token
+
+        self.memory.add("user",      question)
+        self.memory.add("assistant", answer)
+        self.last_answer = answer
+        self.session.record(question, answer, chunks, clause_no=clause_no)
 
     # ── compare ask (side-by-side, multi-vendor) ────────────────────────────────
     def ask_compare(self, question: str, clause_no: str = "") -> str:
